@@ -1,0 +1,7 @@
+bawm
+bawm-panel
+bawm-ctl
+*.o
+*.tar.gz
+*.bak
+*.old
