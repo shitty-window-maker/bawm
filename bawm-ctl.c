@@ -15,7 +15,7 @@ static int try_connect(const char *path) {
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) return -1;
     struct sockaddr_un addr = { .sun_family = AF_UNIX };
-    strncpy(addr.sun_path, path, sizeof(addr.sun_path) - 1);
+    snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", path);
     if (connect(fd, (struct sockaddr*)&addr, sizeof addr) < 0) {
         close(fd);
         return -1;

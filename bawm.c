@@ -341,7 +341,10 @@ static Tile **tslot(Tile **r, Window w) {
     Tile **f = tslot(&(*r)->a, w); return f ? f : tslot(&(*r)->b, w);
 }
 static void tfree(Tile *r) {
-    if (!r) return; tfree(r->a); tfree(r->b); free(r);
+    if (!r) return;
+    tfree(r->a);
+    tfree(r->b);
+    free(r);
 }
 static void tremove(Tile **r, Window w) {
     if (!*r) return;
@@ -372,14 +375,6 @@ static int revive_ghost(Tile **r, Window w) {
     return revive_ghost(&(*r)->a, w) || revive_ghost(&(*r)->b, w);
 }
 /* Deep-copy a Tile subtree so we can restore proportions on reinsert. */
-static Tile *tclone(Tile *r) {
-    if (!r) return NULL;
-    Tile *n = calloc(1, sizeof *n);
-    n->win = r->win; n->ghost = r->ghost;
-    n->dir = r->dir; n->ratio = r->ratio;
-    n->a = tclone(r->a); n->b = tclone(r->b);
-    return n;
-}
 
 static int count_leaves(Tile *r) {
     if (!r) return 0;
@@ -1610,7 +1605,6 @@ static void ipc_out(int fd, const char *fmt, ...) {
     vsnprintf(b, sizeof b, fmt, ap); va_end(ap);
     write(fd, b, strlen(b));
 }
-static int is_reload(int act) { return act == A_RELOAD; }
 static void ipc_cmd(int fd, char *line) {
     char *nl = strchr(line, '\n'); if (nl) *nl = 0;
     if (!*line) return;
@@ -1675,7 +1669,7 @@ static void ipc_init(void) {
     ipc_fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (ipc_fd < 0) return;
     struct sockaddr_un a = { .sun_family = AF_UNIX };
-    strncpy(a.sun_path, path, sizeof a.sun_path - 1);
+    snprintf(a.sun_path, sizeof a.sun_path, "%s", path);
     if (bind(ipc_fd, (struct sockaddr*)&a, sizeof a) < 0 ||
         listen(ipc_fd, 4) < 0) { close(ipc_fd); ipc_fd = -1; return; }
     fprintf(stderr, "bawm: ipc %s\n", path);
