@@ -1,4 +1,4 @@
-/* tinypanel.c — minimal panel for tinywm.
+/* bawm-panel.c — minimal panel for tinywm.
    build: cc -O2 tinypanel.c -o tinypanel -lX11
    click a workspace number to switch. status comes from _BAWM_STATUS
    on the root window; set it with xprop from a shell script. */
