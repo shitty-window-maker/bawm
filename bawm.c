@@ -21,6 +21,7 @@
 #include <sys/select.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <time.h>
 #include <yaml.h>
 
 static int  is_userfloat(Window w);
@@ -32,6 +33,7 @@ static void tile_apply(void);
 
 /* ---------------------------------------------------------------- */
 #define WS_MAX    9
+#define GHOST_TTL 30   /* seconds a ghost keeps its slot before the layout reflows */
 #define BIND_MAX  128
 #define RULE_MAX  64
 #define AUTO_MAX  32
@@ -51,6 +53,7 @@ typedef struct { char *cls, *title; int floating, workspace, skip; } Rule;
 typedef struct Tile {
     Window win;      /* 0 if this leaf is empty (ghost or dead) */
     Window ghost;    /* nonzero: window that was here, moved away */
+    time_t ghost_at; /* when the ghost was created (for TTL sweep) */
     struct Tile *a, *b;
     int dir;         /* 0=vertical 1=horizontal */
     double ratio;
@@ -332,13 +335,25 @@ static Tile *split(Tile *a, Tile *b, int dir) {
 }
 static Tile *tfind(Tile *r, Window w) {
     if (!r) return NULL;
-    if (r->win == w) return r;
+    if (r->win == w || r->ghost == w) return r;
+    if (r->win || r->ghost) return NULL;
     Tile *f = tfind(r->a, w); return f ? f : tfind(r->b, w);
 }
 static Tile **tslot(Tile **r, Window w) {
     if (!*r) return NULL;
-    if ((*r)->win == w) return r;
+    if ((*r)->win == w || (*r)->ghost == w) return r;
+    if ((*r)->win || (*r)->ghost) return NULL;
     Tile **f = tslot(&(*r)->a, w); return f ? f : tslot(&(*r)->b, w);
+}
+
+/* First ghost-only leaf slot in the tree. Used by tinsert to fill a
+   reserved slot when the caller's target is stale or zero. */
+static Tile **find_ghost_slot(Tile **r) {
+    if (!*r) return NULL;
+    if ((*r)->ghost && !(*r)->win && !(*r)->a && !(*r)->b) return r;
+    if ((*r)->win || (*r)->ghost) return NULL;
+    Tile **f = find_ghost_slot(&(*r)->a);
+    return f ? f : find_ghost_slot(&(*r)->b);
 }
 static void tfree(Tile *r) {
     if (!r) return;
@@ -363,14 +378,47 @@ static void tremove(Tile **r, Window w) {
    window id moves out. Used when a window is sent to another workspace. */
 static void tghost(Tile **r, Window w) {
     if (!*r) return;
-    if ((*r)->win == w) { (*r)->ghost = w; (*r)->win = 0; return; }
+    if ((*r)->win == w) {
+        (*r)->ghost = w;
+        (*r)->win = 0;
+        (*r)->ghost_at = time(NULL);
+        return;
+    }
     if ((*r)->win || (*r)->ghost) return;
     tghost(&(*r)->a, w); tghost(&(*r)->b, w);
+}
+
+/* Drop ghost leaves older than GHOST_TTL. Called from tile_apply before
+   layout, so the next layout event reflows around the hole. Leaves the
+   ghost alone if it's still "fresh" — the window may come back. */
+static void tghost_sweep(Tile **r) {
+    if (!*r) return;
+    if ((*r)->ghost && !(*r)->win && !(*r)->a && !(*r)->b) {
+        if (time(NULL) - (*r)->ghost_at > GHOST_TTL) {
+            fprintf(stderr, "bawm: ghost 0x%lx expired\n",
+                    (unsigned long)(*r)->ghost);
+            free(*r);
+            *r = NULL;
+        }
+        return;
+    }
+    if ((*r)->win || (*r)->ghost) return;
+    tghost_sweep(&(*r)->a);
+    tghost_sweep(&(*r)->b);
+    /* collapse internal nodes that lost a child */
+    if (!(*r)->a && !(*r)->b) { free(*r); *r = NULL; return; }
+    if (!(*r)->a) { Tile *b = (*r)->b; free(*r); *r = b; return; }
+    if (!(*r)->b) { Tile *a = (*r)->a; free(*r); *r = a; return; }
 }
 /* If a ghost slot exists for w on this workspace, revive it in place. */
 static int revive_ghost(Tile **r, Window w) {
     if (!*r) return 0;
-    if ((*r)->ghost == w) { (*r)->win = w; (*r)->ghost = 0; return 1; }
+    if ((*r)->ghost == w) {
+        (*r)->win = w;
+        (*r)->ghost = 0;
+        (*r)->ghost_at = 0;
+        return 1;
+    }
     if ((*r)->win || (*r)->ghost) return 0;
     return revive_ghost(&(*r)->a, w) || revive_ghost(&(*r)->b, w);
 }
@@ -384,8 +432,28 @@ static int count_leaves(Tile *r) {
 }
 static void tinsert(int ws, Window target, Window nw) {
     if (!tree[ws]) { tree[ws] = leaf(nw); return; }
+
+    /* A window returning to a workspace it was moved away from
+       gets its old slot back. */
+    if (revive_ghost(&tree[ws], nw)) return;
+
     Tile **slot = target ? tslot(&tree[ws], target) : NULL;
+    if (!slot) slot = find_ghost_slot(&tree[ws]);
     if (!slot) slot = &tree[ws];
+
+    /* A ghost leaf is "reserved for a window that left." A new
+       window landing on it takes the slot over. Without this, the
+       ghost kept its slot but the new window was split off the
+       whole tree, which is the "can't put a window on the ghost's
+       tile" bug. */
+    if ((*slot)->ghost && !(*slot)->win &&
+        !(*slot)->a && !(*slot)->b) {
+        (*slot)->ghost = 0;
+        (*slot)->ghost_at = 0;
+        (*slot)->win   = nw;
+        return;
+    }
+
     Tile *old = *slot;
     int n = count_leaves(tree[ws]);
     *slot = split(old, leaf(nw), n & 1);
@@ -449,9 +517,11 @@ static void read_screen_size(void) {
 
 static void tile_apply(void) {
     read_screen_size();
-    if (cur_ws < 1 || cur_ws > WS_MAX || !tiled[cur_ws] || !tree[cur_ws]) {
+    if (cur_ws < 1 || cur_ws > WS_MAX || !tiled[cur_ws]) {
         XFlush(dpy); return;
     }
+    if (tree[cur_ws]) tghost_sweep(&tree[cur_ws]);
+    if (!tree[cur_ws]) { XFlush(dpy); return; }
     int ph = tile_apply_ph();
     tlayout(tree[cur_ws], 0, ph, SW, SH - ph);
     XFlush(dpy);
@@ -495,10 +565,6 @@ static void focus(Window w, Time t) {
         XSetWindowBorder(dpy, w, col_focus);
         send_take_focus(w, t);
         XSetInputFocus(dpy, w, RevertToPointerRoot, t);
-        /* floats always raise; tiled only raise if the user opted in */
-        if (is_float(w) ||
-            cur_ws < 1 || cur_ws > WS_MAX || !tiled[cur_ws])
-            XRaiseWindow(dpy, w);
     }
     publish_title();
     publish_active();
@@ -842,6 +908,10 @@ static void write_default(const char *path) {
 "  gaps_in:  4\n"
 "  gaps_out: 8\n"
 "  default_on: true\n"
+
+    "float:\n"
+    "  auto_raise: false   # raise floats on focus; Super+r always raises\n"
+    "mouse:\n"
 "\n"
 "mouse:\n"
 "  move:   \"Super+Button1\"\n"
@@ -1216,20 +1286,8 @@ static void do_spawn(const char *cmd) {
 /* floats always stack above tiles. Called after any focus/raise so
    tiles never end up covering a floating window. */
 static void raise_floats(void) {
-    Window rr, pr, *kids; unsigned int n;
-    if (!XQueryTree(dpy, root, &rr, &pr, &kids, &n)) return;
-    for (unsigned int i = 0; i < n; i++) {
-        XWindowAttributes wa;
-        if (!XGetWindowAttributes(dpy, kids[i], &wa)) continue;
-        if (wa.override_redirect) continue;
-        if (is_desktop_window(kids[i])) continue;
-        if (wa.map_state != IsViewable) continue;
-        if (get_ws(kids[i], cur_ws) != cur_ws) continue;
-        if (is_float(kids[i])) XRaiseWindow(dpy, kids[i]);
-    }
-    if (kids) XFree(kids);
-    /* focused float stays at the very top of the pile */
-    if (focused && is_float(focused)) XRaiseWindow(dpy, focused);
+    /* intentionally empty: floats are not auto-raised.
+       Use Super+r to raise the focused window manually. */
 }
 
 /* Global float mode: every workspace stops tiling, every window floats.
@@ -1494,7 +1552,7 @@ static void tile_drag(Window w) {
             sp--; \
             Tile *c = stk[sp]; int X=sx[sp], Y=sy[sp], W=sw[sp], H=sh[sp]; \
             if (!c) continue; \
-            if (c->win) { \
+            if (c->win || c->ghost) { \
                 if ((MX)>=X && (MX)<X+W && (MY)>=Y && (MY)<Y+H) { \
                     (DST) = c; \
                     int cx0 = X + W/3, cy0 = Y + H/3; \
@@ -1573,7 +1631,19 @@ static void tile_drag(Window w) {
                 Tile *dst; int side;
                 HIT_TEST(e.xbutton.x_root, e.xbutton.y_root, dst, side);
                 if (dst && dst != src && side >= 0) {
-                    if (side == 4) {
+                    if (dst->ghost && !dst->win) {
+                        /* ghost slot: dragged window takes it, old slot
+                           becomes a ghost of the dragged window */
+                        Window old = src->win;
+                        dst->ghost = 0;
+                        dst->ghost_at = 0;
+                        dst->win   = w;
+                        src->win   = 0;
+                        src->ghost = old;
+                        src->ghost_at = time(NULL);
+                        fprintf(stderr, "bawm: drop into ghost slot\n");
+                        tile_apply();
+                    } else if (side == 4) {
                         Window tmp = dst->win;
                         dst->win = src->win;
                         src->win = tmp;
@@ -1661,18 +1731,25 @@ static void ipc_handle(void) {
 }
 static void ipc_init(void) {
     const char *xdg = getenv("XDG_RUNTIME_DIR"), *home = getenv("HOME");
-    char path[256];
-    if (xdg && *xdg) snprintf(path, sizeof path, "%s/bawm.sock", xdg);
-    else if (home && *home) snprintf(path, sizeof path, "%s/.bawm.sock", home);
-    else snprintf(path, sizeof path, "/tmp/bawm-%d.sock", (int)getuid());
-    unlink(path);
+    struct sockaddr_un a = { .sun_family = AF_UNIX };
+    int n;
+    if (xdg && *xdg)
+        n = snprintf(a.sun_path, sizeof a.sun_path, "%s/bawm.sock", xdg);
+    else if (home && *home)
+        n = snprintf(a.sun_path, sizeof a.sun_path, "%s/.bawm.sock", home);
+    else
+        n = snprintf(a.sun_path, sizeof a.sun_path,
+                     "/tmp/bawm-%d.sock", (int)getuid());
+    if (n < 0 || n >= (int)sizeof a.sun_path) {
+        fprintf(stderr, "bawm: ipc path too long\n");
+        return;
+    }
+    unlink(a.sun_path);
     ipc_fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (ipc_fd < 0) return;
-    struct sockaddr_un a = { .sun_family = AF_UNIX };
-    snprintf(a.sun_path, sizeof a.sun_path, "%s", path);
     if (bind(ipc_fd, (struct sockaddr*)&a, sizeof a) < 0 ||
         listen(ipc_fd, 4) < 0) { close(ipc_fd); ipc_fd = -1; return; }
-    fprintf(stderr, "bawm: ipc %s\n", path);
+    fprintf(stderr, "bawm: ipc %s\n", a.sun_path);
 }
 
 /* ---------------------------------------------------------------- */
@@ -1909,12 +1986,11 @@ int main(int argc, char **argv) {
                     XUnmapWindow(dpy, w);
                 } else if (!in_switch) {
                     if (tiled[target] && !flt) {
-                        /* if a slot was reserved for this exact window,
-                           put it back there instead of inserting anew */
-                        if (!revive_ghost(&tree[target], w))
-                            tinsert(target, focused, w);
+                        tinsert(target, focused, w);
                     }
                     if (flt) {
+                        fprintf(stderr, "bawm: DBG MapRequest float 0x%lx\n",
+                                (unsigned long)w);
                         int ww = SW * 2 / 3;
                         int wh = (SH - tile_apply_ph()) * 2 / 3;
                         XMoveWindow(dpy, w, (SW - ww)/2,
@@ -1935,6 +2011,7 @@ int main(int argc, char **argv) {
                             !is_float(cr->window));
                 int mask = cr->value_mask;
                 if (is_t) mask &= ~(CWX|CWY|CWWidth|CWHeight);
+        mask &= ~CWStackMode;
                 if (mask) {
                     XWindowChanges wc = {
                         .x = cr->x, .y = cr->y,
@@ -2016,7 +2093,6 @@ int main(int argc, char **argv) {
                     if (cm->data.l[1]) last_time = cm->data.l[1];
                     if (cm->window != None) {
                         focus(cm->window, cm->data.l[1] ? cm->data.l[1] : 0);
-                        XRaiseWindow(dpy, cm->window);
                     }
                 } else if (cm->message_type == A_CLOSEW) {
                     close_win(cm->window);
